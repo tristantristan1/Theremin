@@ -1,54 +1,107 @@
-#include <stdio.h>
+#ifndef F_CPU
+#define F_CPU 16000000UL
+#endif
 
-// Pin mapping>
-#define BUZZER_PORT   PORTD
-#define BUZZER_DDR    DDRD
-#define BUZZER_PINR   PIND
-#define BUZZER_PIN    PD3
-#define BUZZER_BIT    (1 << PD3)
+#include <avr/io.h>
+#include <util/delay.h>
+#include <stdbool.h>
+#include <stdint.h>
 
-// HC-SR04 (Trigger: PB1, Echo: PB0)
-#define US_TRIG_PORT  PORTB
-#define US_TRIG_DDR   DDRB
-#define US_TRIG_PINR  PINB
-#define US_TRIG_PIN   PB1
-#define US_TRIG_BIT   (1 << PB1)
+/* Pins, Arduino Uno */
+#define TRIG_PORT PORTD
+#define TRIG_DDR  DDRD
+#define TRIG_BIT  PD5      /* D5 */
 
-#define US_ECHO_PORT  PORTB
-#define US_ECHO_DDR   DDRB
-#define US_ECHO_PINR  PINB
-#define US_ECHO_PIN   PB0
-#define US_ECHO_BIT   (1 << PB0)
+#define ECHO_PINR PIND
+#define ECHO_DDR  DDRD
+#define ECHO_BIT  PD6      /* D6 */
 
-// Buttons (filter +/-) met interne pull-ups (PD4, PD5)
-#define BTN_DEC_PORT  PORTD
-#define BTN_DEC_DDR   DDRD
-#define BTN_DEC_PINR  PIND
-#define BTN_DEC_PIN   PD4
-#define BTN_DEC_BIT   (1 << PD4)
-
-#define BTN_INC_PORT  PORTD
-#define BTN_INC_DDR   DDRD
-#define BTN_INC_PINR  PIND
-#define BTN_INC_PIN   PD5
-#define BTN_INC_BIT   (1 << PD5)
-
-// Potmeter (volume) — ADC0 op PC0
-#define POT_ADC_CH    0
-#define POT_ADC_PIN   PC0
-
-#define TWI_SDA_PIN   PC4
-#define TWI_SCL_PIN   PC5
-#define LCD_I2C_ADDR  0x27
-
-int myFunction(int, int);
-
-int main(void) {
-    int result = myFunction(2, 3);
-    printf("Resultaat: %d\n", result);
-    return 0;
+/* UART 9600 bps, alleen zenden */
+static void uart_init(void) {
+    /* UBRR = F_CPU / (16 * baud) - 1  bij 16 MHz en 9600 is dat 103 */
+    UBRR0H = (uint8_t)(103 >> 8);
+    UBRR0L = (uint8_t)(103 & 0xFF);
+    UCSR0B = (1 << TXEN0);                      /* TX aan */
+    UCSR0C = (1 << UCSZ01) | (1 << UCSZ00);     /* 8N1 */
+}
+static void uart_putc(char c) {
+    while (!(UCSR0A & (1 << UDRE0))) {}
+    UDR0 = c;
+}
+static void uart_print(const char *s) {
+    while (*s) uart_putc(*s++);
+}
+static void uart_print_u32(uint32_t v) {
+    char buf[11];
+    int i = 10;
+    buf[i--] = '\0';
+    if (v == 0) { uart_putc('0'); return; }
+    while (v && i >= 0) { buf[i--] = '0' + (v % 10); v /= 10; }
+    uart_print(&buf[i + 1]);
 }
 
-int myFunction(int x, int y) {
-    return x + y;
+
+
+static void hcsr04_init(void) {
+    
+    TRIG_PORT &= ~(1 << TRIG_BIT);
+    TRIG_DDR  |=  (1 << TRIG_BIT);
+
+    ECHO_DDR &= ~(1 << ECHO_BIT);
+    PORTD    &= ~(1 << ECHO_BIT);
+
+    /* Timer1 prescaler 8, 0,5 us per tick */
+    TCCR1A = 0;
+    TCCR1B = (1 << CS11);
+    TCNT1  = 0;
+}
+
+static void hcsr04_trigger(void) {
+    TRIG_PORT &= ~(1 << TRIG_BIT);
+    _delay_us(2);
+    TRIG_PORT |=  (1 << TRIG_BIT);
+    _delay_us(10);
+    TRIG_PORT &= ~(1 << TRIG_BIT);
+}
+
+static bool hcsr04_read_mm(uint32_t *mm_out) {
+    hcsr04_trigger();
+
+    uint32_t guard = 40000UL;
+    while (!(ECHO_PINR & (1 << ECHO_BIT))) {
+        if (--guard == 0) return false;
+        _delay_us(1);
+    }
+    uint16_t t_start = TCNT1;
+
+    guard = 40000UL;
+    while (ECHO_PINR & (1 << ECHO_BIT)) {
+        if (--guard == 0) return false;
+        _delay_us(1);
+    }
+    uint16_t t_end = TCNT1;
+
+    uint16_t ticks = t_end - t_start;
+
+    /* afstand in mm, afgerond */
+    uint32_t mm = ((uint32_t)ticks * 5U + 29U) / 58U;
+    *mm_out = mm;
+    return true;
+}
+
+int main(void) {
+    uart_init();
+    hcsr04_init();
+
+    while (1) {
+        uint32_t mm;
+        if (hcsr04_read_mm(&mm)) {
+            uart_print("afstand_mm=");
+            uart_print_u32(mm);
+            uart_print("\r\n");
+        } else {
+            uart_print("timeout\r\n");
+        }
+        _delay_ms(100);
+    }
 }
