@@ -5,6 +5,7 @@
 #include <util/delay.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <avr/interrupt.h>
 
 /* ---------- HC-SR04, PD5 trig, PD6 echo ---------- */
 #define TRIG_PORT PORTD
@@ -23,11 +24,16 @@
 #define LCD_BL  (1 << 3)
 static uint8_t lcd_bl = LCD_BL;
 
-/* ---------- Buzzer op PD3, OC2B, Timer2, continue ---------- */
+/* ---------- Buzzer op PD3, OC2B, Timer2 ---------- */
 #define BUZZ_DDR   DDRD
 #define BUZZ_PORT  PORTD
 #define BUZZ_PIN   PD3
 
+/* ---------- Volume en gating ---------- */
+static volatile uint8_t g_volume_pct = 100;  /* 0 tot 100 */
+static volatile bool g_buzzer_allow = false; /* staat of we mogen klinken */
+
+/* ---------- Ultrasoon ---------- */
 static void hcsr04_init(void) {
     TRIG_PORT &= ~(1 << TRIG_BIT);
     TRIG_DDR  |=  (1 << TRIG_BIT);
@@ -72,6 +78,7 @@ static bool hcsr04_read_mm(uint32_t *mm_out) {
     return true;
 }
 
+/* ---------- I2C, PCF8574 ---------- */
 static void TWI_init_100k(void) {
     TWSR = 0x00;      /* prescaler 1 */
     TWBR = 72;        /* 100 kHz bij 16 MHz */
@@ -98,6 +105,7 @@ static void PCF8574_write(uint8_t d) {
     TWI_stop();
 }
 
+/* ---------- LCD helpers ---------- */
 static void lcd_pulse(uint8_t d) {
     PCF8574_write(d | LCD_EN);
     _delay_us(1);
@@ -105,9 +113,9 @@ static void lcd_pulse(uint8_t d) {
     _delay_us(50);
 }
 static void lcd_write4(uint8_t hi, uint8_t rs) {
-    uint8_t d = (hi & 0xF0) | (rs ? LCD_RS : 0);
-    PCF8574_write(d);
-    lcd_pulse(d);
+    uint8_t out = (hi & 0xF0) | (rs ? LCD_RS : 0);
+    PCF8574_write(out);
+    lcd_pulse(out);
 }
 static void lcd_write(uint8_t v, uint8_t rs) {
     lcd_write4(v & 0xF0, rs);
@@ -150,33 +158,96 @@ static void lcd_print_u32(uint32_t v) {
     const char *p = &b[i + 1]; while (*p) lcd_data(*p++);
 }
 
+/* ---------- ADC voor volume op PC0 ---------- */
+static void adc0_init(void) {
+    DDRC  &= ~(1 << PC0);
+    ADMUX  = (1 << REFS0);
+    ADCSRA = (1 << ADEN)
+           | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
+    DIDR0 |= (1 << ADC0D);
+}
+static uint16_t adc0_read(void) {
+    ADMUX = (ADMUX & 0xF0) | 0;
+    ADCSRA |= (1 << ADSC);
+    while (ADCSRA & (1 << ADSC)) {}
+    return ADC;
+}
+static uint8_t adc_to_volume_pct(uint16_t adc) {
+    uint32_t pct = ((uint32_t)adc * 100U + 511U) / 1023U;
+    if (pct > 100U) pct = 100U;
+    return (uint8_t)pct;
+}
+
+/* ---------- Buzzer, Timer2 toon ---------- */
 static void buzzer_init_pd3(void) {
-    BUZZ_DDR |= (1<<BUZZ_PIN);
-    /* Fast PWM, TOP = OCR2A, OC2B non inverting, klok nog uit */
-    TCCR2A = (1<<WGM21) | (1<<WGM20) | (1<<COM2B1);
+    /* start in high Z, pas bij aanzetten maken we output */
+    BUZZ_DDR &= ~(1<<BUZZ_PIN);
+    BUZZ_PORT &= ~(1<<BUZZ_PIN);
+
+    /* Fast PWM, TOP = OCR2A, OC2B non inverting */
+    TCCR2A = (1<<WGM21) | (1<<WGM20);
     TCCR2B = (1<<WGM22);
-    /* vaste prescaler 256, goede resolutie voor 300..3000 Hz */
-    OCR2A = 207;                 /* startwaarde, circa 300 Hz */
+    OCR2A = 207;                 /* circa 300 Hz */
     OCR2B = (OCR2A + 1) / 2;     /* 50 procent duty */
     TCNT2 = 0;
-    TCCR2B |= (1<<CS22) | (1<<CS21); /* prescaler 256, start klok */
+    TCCR2B |= (1<<CS22) | (1<<CS21); /* prescaler 256 */
 }
 static void buzzer_set_freq_pd3(uint32_t f_hz) {
     if (f_hz < 300)  f_hz = 300;
     if (f_hz > 3000) f_hz = 3000;
-    uint32_t ocr = (F_CPU / (256UL * f_hz)) - 1UL;   /* 19..207 */
+    uint32_t ocr = (F_CPU / (256UL * f_hz)) - 1UL;
     if (ocr < 1)   ocr = 1;
     if (ocr > 255) ocr = 255;
     uint8_t top = (uint8_t)ocr;
     OCR2A = top;
-    OCR2B = (uint8_t)((top + 1) / 2);  /* 50 procent duty */
+    OCR2B = (uint8_t)((top + 1) / 2);
 }
-static void buzzer_mute_pd3(void) {
-    TCCR2A &= ~((1<<COM2B1)|(1<<COM2B0));
+
+static inline void buzzer_drive_enable(void) {
+    BUZZ_DDR  |=  (1<<BUZZ_PIN);
+    TCCR2A    |=  (1<<COM2B1);
+}
+static inline void buzzer_drive_disable(void) {
+    TCCR2A    &= ~((1<<COM2B1)|(1<<COM2B0));
+    BUZZ_DDR  &= ~(1<<BUZZ_PIN);
     BUZZ_PORT &= ~(1<<BUZZ_PIN);
 }
-static void buzzer_unmute_pd3(void) {
-    TCCR2A |= (1<<COM2B1);
+
+
+static void volume_pwm_init_timer0(void) {
+    TCCR0A = (1<<WGM01) | (1<<WGM00);
+    TCCR0B = (1<<CS01) | (1<<CS00);     /* prescaler 64, circa 976 Hz */
+    TIMSK0 = (1<<TOIE0) | (1<<OCIE0A);  /* enable OVF en COMPA */
+    OCR0A = 255;                        /* 100 procent aan */
+}
+
+static void volume_set_pct(uint8_t pct) {
+    if (pct > 100) pct = 100;
+    g_volume_pct = pct;
+    /* map 0..100 naar 0..255 met p^2, 0 uit, 100 bijna continu aan */
+    uint16_t p = pct;
+    uint16_t ocr = (uint16_t)((p * p * 255UL + 5000UL) / 10000UL); /* p^2 schaal */
+    OCR0A = (uint8_t)ocr;
+}
+
+ISR(TIMER0_OVF_vect) {
+    if (g_buzzer_allow && g_volume_pct > 0) {
+        buzzer_drive_enable();
+    } else {
+        buzzer_drive_disable();
+    }
+}
+
+ISR(TIMER0_COMPA_vect) {
+    if (g_buzzer_allow) {
+        if (g_volume_pct < 100) {
+            buzzer_drive_disable();
+        } else {
+            /* 100 procent, laat aan */
+        }
+    } else {
+        buzzer_drive_disable();
+    }
 }
 
 static uint32_t map_mm_to_hz(uint32_t mm) {
@@ -190,10 +261,9 @@ static uint32_t map_mm_to_hz(uint32_t mm) {
     return f_near - num / den;     /* hogere toon bij kleinere afstand */
 }
 
-
-/* Exponential Moving Average, eenvoudige integer versie */
+/* ---------- Exponential Moving Average ---------- */
 static uint32_t mm_filt = 0;        /* 0 betekent nog niet geïnitialiseerd */
-#define EMA_ALPHA  32               /* 32/256 ongeveer 0,125 */
+#define EMA_ALPHA  32               /* 32 op 256 is ongeveer 0,125 */
 static uint32_t ema_update(uint32_t x) {
     if (mm_filt == 0) { mm_filt = x << 8; }                      /* init */
     mm_filt = mm_filt + ((int32_t)((x << 8) - mm_filt) * EMA_ALPHA) / 256;
@@ -205,12 +275,30 @@ int main(void) {
     lcd_init();
     lcd_backlight(1);
     hcsr04_init();
+    adc0_init();
     buzzer_init_pd3();
+    volume_pwm_init_timer0();
+    sei();
 
     lcd_set_cursor(0, 0);
     lcd_print("freq:");
+    lcd_set_cursor(0, 1);
+    lcd_print("vol:");
+
+    g_buzzer_allow = false;
+    volume_set_pct(100);
 
     while (1) {
+        uint16_t adc = adc0_read();
+        uint8_t vol = adc_to_volume_pct(adc);
+        volume_set_pct(vol);
+
+        lcd_set_cursor(4, 1);
+        lcd_print("     ");
+        lcd_set_cursor(4, 1);
+        lcd_print_u32(g_volume_pct);
+        lcd_print("%");
+
         uint32_t mm_raw;
         if (hcsr04_read_mm(&mm_raw)) {
             uint32_t mm = ema_update(mm_raw);
@@ -218,31 +306,29 @@ int main(void) {
             if (mm >= 50 && mm <= 600) {
                 uint32_t f = map_mm_to_hz(mm);
 
-                
                 lcd_set_cursor(5, 0);
                 lcd_print("      ");
                 lcd_set_cursor(5, 0);
                 lcd_print_u32(f);
                 lcd_print(" Hz");
 
-                buzzer_unmute_pd3();
                 buzzer_set_freq_pd3(f);
+                g_buzzer_allow = (g_volume_pct > 0);
             } else {
-                buzzer_mute_pd3();
+                g_buzzer_allow = false;
                 lcd_set_cursor(5, 0);
                 lcd_print("      ");
                 lcd_set_cursor(5, 0);
                 lcd_print("0 Hz");
             }
         } else {
-            buzzer_mute_pd3();
+            g_buzzer_allow = false;
             lcd_set_cursor(5, 0);
             lcd_print("      ");
             lcd_set_cursor(5, 0);
             lcd_print("timeout");
         }
 
-        //_delay_ms(80);
+        _delay_ms(5);
     }
-
 }
