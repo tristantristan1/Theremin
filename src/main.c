@@ -9,7 +9,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-/* ---------- I2C, LCD ---------- */
+// I2C LCD
 #define PCF8574_ADDR_LCD 0x27
 #define LCD_RS (1 << 0)
 #define LCD_RW (1 << 1)
@@ -17,9 +17,9 @@
 #define LCD_BL (1 << 3)
 
 static uint8_t lcd_bl = LCD_BL;
+static uint8_t last_filter_size = 0;
 
-/* ---------- Pins volgens technisch ontwerp ---------- */
-/* Buzzer op PD3, OC2B, volume via Timer2 fast PWM 62,5 kHz, audiotoon via Timer0 CTC. Trigger ping sensor op PB1, Echo op PB0, ADC volume op PC0, knoppen PD4 en PD5. */
+//pins
 #define BUZZ_PORT PORTD
 #define BUZZ_DDR DDRD
 #define BUZZ_PIN PD3
@@ -28,14 +28,14 @@ static uint8_t lcd_bl = LCD_BL;
 #define TRIG_PIN PB1
 #define ECHO_PINR PINB
 #define ECHO_DDR DDRB
-#define ECHO_PIN PB0 /* ICP1 */
+#define ECHO_PIN PB0 // ICP1
 
-/* ---------- TWI basic ---------- */
+//TWI
 static void TWI_init_100k(void) {
     TWSR = 0x00;
-    TWBR = 72; /* 100 kHz bij 16 MHz */
+    TWBR = 72; //100 kHz bij 16 MHz
     TWCR = (1 << TWEN);
-    PORTC |= (1 << PC4) | (1 << PC5); /* pull ups */
+    PORTC |= (1 << PC4) | (1 << PC5); //pull ups
 }
 
 static void TWI_start(void) {
@@ -53,7 +53,7 @@ static void TWI_write(uint8_t d) {
     while (!(TWCR & (1 << TWINT))) {}
 }
 
-/* ---------- LCD helpers ---------- */
+//LCD helpers
 static void PCF8574_write(uint8_t addr, uint8_t d) {
     TWI_start();
     TWI_write((addr << 1) | 0);
@@ -135,55 +135,55 @@ static void lcd_print_u32(uint32_t v) {
     while (*p) lcd_data((uint8_t)*p++);
 }
 
-/* ---------- ADC volume, freerun 8 bit via ADCH ---------- */
-static volatile uint8_t g_volume_pct = 100; /* 0..100 voor UI */
-static volatile uint8_t g_vol_raw255 = 255; /* 0..255 voor OCR2B */
+//ADC volume, freerun 8 bit via ADCH
+static volatile uint8_t g_volume_pct = 100; // 0-100
+static volatile uint8_t g_vol_raw255 = 255; //0-255
 
 static void adc_init_freerun_pc0_8bit(void) {
     DDRC &= ~(1 << PC0);
-    ADMUX = (1 << REFS0) | (1 << ADLAR) | 0; /* AVCC ref, left adjust */
+    ADMUX = (1 << REFS0) | (1 << ADLAR) | 0;
     ADCSRA = (1 << ADEN) | (1 << ADSC) | (1 << ADATE) | (1 << ADIE) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
-    ADCSRB = 0; /* freerun */
+    ADCSRB = 0;
     DIDR0 |= (1 << ADC0D);
 }
 
 ISR(ADC_vect) {
     uint8_t adch = ADCH;
-    g_vol_raw255 = adch; /* direct carrier duty */
+    g_vol_raw255 = adch;
     uint16_t pct = ((uint16_t)adch * 100U + 127U) / 255U;
     if (pct > 100) pct = 100;
     g_volume_pct = (uint8_t)pct;
 }
 
-/* ---------- Buzzer volume, Timer2 fast PWM 62,5 kHz ---------- */
+// Buzzer volume, Timer2 fast PWM 62,5 kHz
 static void pwm_init_timer2(void) {
     BUZZ_DDR |= (1 << BUZZ_PIN);
-    TCCR2A = (1 << COM2B1) | (1 << WGM21) | (1 << WGM20); /* Fast PWM, non inverting */
-    TCCR2B = (1 << CS20); /* no prescaler, 62,5 kHz */
+    TCCR2A = (1 << COM2B1) | (1 << WGM21) | (1 << WGM20); //Fast PWM, non inverting
+    TCCR2B = (1 << CS20); // no prescaler, 62,5 kHz
     OCR2B = 0;
     TIMSK2 = (1 << TOIE2);
 }
 
-ISR(TIMER2_OVF_vect) { /* niets nodig */ }
+ISR(TIMER2_OVF_vect) {}
 
-/* ---------- Audiotoon, Timer0 in CTC, toggelt COM2B1 ---------- */
+//Audiotoon, Timer0 in CTC, toggelt COM2B1
 static void tone_init_timer0(uint16_t freq_hz) {
-    TCCR0A = (1 << WGM01); /* CTC */
-    TCCR0B = (1 << CS02); /* prescaler 256 */
+    TCCR0A = (1 << WGM01); // CTC
+    TCCR0B = (1 << CS02); // prescaler 256
     uint16_t ocr = (F_CPU / (2UL * 256UL * freq_hz)) - 1UL;
     if (ocr > 255) ocr = 255;
     if (ocr < 1) ocr = 1;
     OCR0A = (uint8_t)ocr;
-    TIMSK0 = (1 << OCIE0A); /* COMPA interrupt */
+    TIMSK0 = (1 << OCIE0A); // COMPA interrupt
 }
 
 ISR(TIMER0_COMPA_vect) {
-    TCCR2A ^= (1 << COM2B1); /* 50 procent audioplicht */
-    OCR2B = g_vol_raw255; /* duty updaten */
+    TCCR2A ^= (1 << COM2B1); // 50 procent audioplicht
+    OCR2B = g_vol_raw255; // duty updaten
 }
 
-/* ---------- Knoppen PD4 en PD5 ---------- */
-static volatile uint8_t g_filter_size = 5; /* 1..15 */
+//Knoppen PD4 en PD5
+static volatile uint8_t g_filter_size = 5; //1-15
 static volatile uint8_t btn_last = 0x30;
 
 static void buttons_init_pd4_pd5_pcint(void) {
@@ -205,11 +205,11 @@ ISR(PCINT2_vect) {
     btn_last = now;
 }
 
-/* ---------- Ping sensor via Timer1 Input Capture ---------- */
+//Ping sensor via Timer1 Input Capture
 typedef enum { PING_IDLE, PING_TRIG_HI, PING_WAIT_ECHO } ping_state_t;
 static volatile ping_state_t ping_state = PING_IDLE;
 static volatile uint16_t icr_rise = 0, icr_fall = 0;
-static volatile bool echo_done = false; /* 32 bit tijd via overflow teller, tick = 0,5 us bij prescaler 8 */
+static volatile bool echo_done = false; // 32 bit tijd via overflow teller, tick = 0,5 us bij prescaler 8
 static volatile uint32_t t1_overflows = 0;
 
 ISR(TIMER1_OVF_vect) {
@@ -228,11 +228,11 @@ static inline uint32_t t1_now_ticks(void) {
 static void ping_init_icp1(void) {
     TRIG_DDR |= (1 << TRIG_PIN);
     TRIG_PORT &= ~(1 << TRIG_PIN);
-    DDRB &= ~(1 << PB0); /* ICP1 input */
-    /* Timer1, prescaler 8, noise cancel aan, start op rising edge */
+    DDRB &= ~(1 << PB0); // ICP1 input
+    // Timer1, prescaler 8, noise cancel aan, start op rising edge
     TCCR1A = 0x00;
     TCCR1B = (1 << ICNC1) | (1 << CS11) | (1 << ICES1);
-    TIMSK1 = (1 << ICIE1) | (1 << TOIE1); /* capture en overflow interrupt */
+    TIMSK1 = (1 << ICIE1) | (1 << TOIE1); // capture en overflow interrupt
     TCNT1 = 0;
     t1_overflows = 0;
 }
@@ -242,8 +242,8 @@ static inline void ping_trigger_start(void) {
     ping_state = PING_TRIG_HI;
 }
 
-/* minimaal 60 ms tussen pings */
-#define PING_INTERVAL_TICKS 120000UL /* 60 ms bij 0,5 us per tick */
+// minimaal 60 ms tussen pings
+#define PING_INTERVAL_TICKS 120000UL // 60 ms bij 0,5 us per tick
 static uint32_t next_ping_at = 0;
 
 static inline void ping_state_machine(void) {
@@ -269,18 +269,18 @@ ISR(TIMER1_CAPT_vect) {
     static bool want_fall = false;
     if (!want_fall) {
         icr_rise = ICR1;
-        TCCR1B &= ~(1 << ICES1); /* nu falling edge */
+        TCCR1B &= ~(1 << ICES1); // nu falling edge
         want_fall = true;
     } else {
         icr_fall = ICR1;
-        TCCR1B |= (1 << ICES1); /* terug naar rising */
+        TCCR1B |= (1 << ICES1); // terug naar rising
         want_fall = false;
         echo_done = true;
         next_ping_at = t1_now_ticks() + PING_INTERVAL_TICKS;
     }
 }
 
-/* haal meting op, true als nieuwe afstand beschikbaar is */
+//haal meting op, true als nieuwe afstand beschikbaar is
 static bool ping_get_distance_mm(uint32_t *mm_out) {
     if (!echo_done) return false;
     echo_done = false;
@@ -291,7 +291,7 @@ static bool ping_get_distance_mm(uint32_t *mm_out) {
     return true;
 }
 
-/* ---------- 7-segment display ---------- */
+//7-segment display
 #define SEGMENT_ADDR 0x21  // I2C-adres van het 7-segment display
 
 const uint8_t hex_digits[] = {
@@ -330,7 +330,7 @@ static void display_hex_digit(uint8_t digit, uint8_t position) {
     TWI_stop();
 }
 
-/* ---------- Frequentiemapping ---------- */
+//Frequentiemapping
 static inline uint16_t freq_from_cm(uint16_t cm) {
     if (cm < 5) cm = 5;
     if (cm > 65) cm = 65;
@@ -348,8 +348,9 @@ static inline uint16_t freq_from_cm(uint16_t cm) {
     return (uint16_t)freq;
 }
 
-/* ---------- main ---------- */
+//main
 int main(void) {
+    
     TWI_init_100k();
     lcd_init();
     lcd_backlight(1);
@@ -396,12 +397,16 @@ int main(void) {
             lcd_print("cm");
 
             lcd_set_cursor(8, 0);  
-            lcd_print("   ");
+            lcd_print("     ");
             lcd_set_cursor(8, 0);  
             lcd_print_u32(g_filter_size);
 
             // Update het 7-segment display met de filtergrootte in hex
+            if (g_filter_size != last_filter_size) {
             display_hex_digit(g_filter_size, 0);  // Zet de filtergrootte op het display
+            last_filter_size = g_filter_size;    // Werk de vorige waarde bij
+            }
+        // Zet de filtergrootte op het display
 
             lcd_set_cursor(3, 1);  
             lcd_print("   ");      
